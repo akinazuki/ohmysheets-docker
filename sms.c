@@ -221,8 +221,8 @@ int main(int argc, char **argv) {
 
     /* 2. Set global template path */
     void *na = dlsym(RTLD_DEFAULT, "nativeAnalyze");
-    unsigned long base = (unsigned long)na - 0x289178;
-    *(char **)(base + 0x351DD8) = "/app/assets/templates/";
+    unsigned long base = (unsigned long)na - 0x28927c;
+    *(char **)(base + 0x351F08) = "/app/assets/templates/";
 
     analyze_fn do_analyze = (analyze_fn)dlsym(RTLD_DEFAULT, "analyze");
 
