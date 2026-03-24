@@ -137,16 +137,18 @@ static void *tpl_cb(int h) {
 /* Progress callback bridge */
 static const char *stage_names[] = {
     [0] = NULL, [1] = NULL,
-    [2] = "Preprocessing",
-    [3] = "Detecting staves",
-    [4] = "Splitting staves",
-    [5] = "Analyzing staves",
-    [6] = "Building score",
-    [7] = "Completed",
+    [2] = "PREPROCESSING",
+    [3] = "DETECTING_STAVES",
+    [4] = "SPLITTING_STAVES",
+    [5] = "ANALYZING_STAVES",
+    [6] = "BUILDING_SCORE",
+    [7] = "COMPLETED",
+    [8] = "COMPLETED",
 };
+#define STAGE_MAX 8
 
 static void internal_progress_cb(void *scanner, int stage) {
-    const char *name = (stage >= 2 && stage <= 7) ? stage_names[stage] : NULL;
+    const char *name = (stage >= 2 && stage <= STAGE_MAX) ? stage_names[stage] : NULL;
     if (g_progress_cb) {
         g_progress_cb(g_cur_page, g_total_pages, stage, name, g_userdata);
     }

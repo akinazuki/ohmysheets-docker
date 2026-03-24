@@ -18,12 +18,36 @@ if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
     docker build --platform linux/arm64/v8 -t "$IMAGE_NAME" "$SCRIPT_DIR"
 fi
 
+# --- Serve mode ---
+if [ "$1" = "serve" ]; then
+    PORT="${2:-8080}"
+    CONTAINER_NAME="sms-server"
+    docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+
+    echo "Starting SMS server on http://localhost:${PORT}"
+    echo "  POST /analyze  — multipart 'images' field"
+    echo "  GET  /health"
+    echo ""
+    echo "  curl -X POST http://localhost:${PORT}/analyze -F 'images=@score.png' -o output.mid"
+    echo ""
+
+    exec docker run --rm --name "$CONTAINER_NAME" \
+        --platform linux/arm64/v8 \
+        -p "${PORT}:8080" \
+        "$IMAGE_NAME" \
+        serve :8080
+fi
+
+# --- CLI mode ---
+
 INPUT="$1"
 if [ -z "$INPUT" ]; then
     echo "Usage: $0 <image.png|jpg|heic|directory> [output.mid]"
+    echo "       $0 serve [port]"
     echo ""
     echo "Single page:  $0 score.png"
     echo "Multi-page:   $0 /path/to/pages/   (per-page session linking)"
+    echo "HTTP server:  $0 serve 8080"
     exit 1
 fi
 

@@ -1,8 +1,12 @@
 FROM arm64v8/debian:bookworm-slim
 
 RUN apt-get update -qq && \
-    apt-get install -qq -y gcc libc6-dev zlib1g-dev binutils python3 golang-go && \
+    apt-get install -qq -y gcc libc6-dev zlib1g-dev binutils python3 ca-certificates curl && \
     rm -rf /var/lib/apt/lists/*
+
+# Install Go 1.22 (needed for gin and modern Go features)
+RUN curl -fsSL https://go.dev/dl/go1.22.10.linux-arm64.tar.gz | tar -C /usr/local -xz
+ENV PATH="/usr/local/go/bin:${PATH}"
 
 WORKDIR /app
 
@@ -20,7 +24,9 @@ COPY assets/templates/ /app/assets/templates/
 # stubs.c goes to a separate dir (compiled as .so, must NOT be in cgo's scope)
 # sms.c is the legacy standalone CLI, kept for reference only
 COPY stubs.c /app/compat/
-COPY sms_lib.h sms_lib.c bridge.c sms.go callback.go main.go go.mod /app/
+COPY go.mod go.sum* /app/
+RUN cd /app && go mod download 2>/dev/null || true
+COPY sms_lib.h sms_lib.c bridge.c sms.go callback.go main.go /app/
 
 # Patch ELF binaries and build
 #   1. patch_elf.py: zero .gnu.version, null DT_VERNEED/DT_VERNEEDNUM
@@ -39,7 +45,7 @@ RUN set -e && \
     gcc -shared -fPIC -o $LIB/libandroid_stubs.so /app/compat/stubs.c -ldl && \
     ln -sf libandroid_stubs.so $LIB/liblog.so && \
     ln -sf libandroid_stubs.so $LIB/libjnigraphics.so && \
-    cd /app && CGO_ENABLED=1 go build -o /app/sms .
+    cd /app && go mod tidy && CGO_ENABLED=1 go build -o /app/sms .
 
 RUN mkdir -p /app/assets /app/output
 
