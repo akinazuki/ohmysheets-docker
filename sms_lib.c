@@ -114,6 +114,7 @@ static analyze_fn g_do_analyze = NULL;
 
 static sms_log_fn g_log_cb = NULL;
 static sms_progress_fn g_progress_cb = NULL;
+static sms_page_done_fn g_page_done_cb = NULL;
 static void *g_userdata = NULL;
 static int g_cur_page = 0;
 static int g_total_pages = 0;
@@ -248,14 +249,163 @@ static int cmp_evt(const void *a, const void *b) {
     return d ? d : ((MidiEvt *)a)->on - ((MidiEvt *)b)->on;
 }
 
+/* Build a complete MIDI buffer from a single Score's singleBaraa.
+ * Returns SmsMidi with .data/.len. Caller must free .data.
+ * out_notes/out_bars are set if non-NULL. */
+static SmsMidi build_midi_from_score(Score *sc, int tpq, int bpm,
+                                     int *out_notes, int *out_bars) {
+    SmsMidi result = {0};
+    int nStaves = 0;
+    int gks_type = 1, gks_count = 0;
+
+    for (int i = 0; i < 20; i++) {
+        if (baraaGetBarCount(sc->singleBaraa, i) <= 0) break;
+        nStaves++;
+    }
+    for (int si = 0; si < nStaves && gks_count == 0; si++) {
+        int nb = baraaGetBarCount(sc->singleBaraa, si);
+        for (int bi = 0; bi < nb; bi++) {
+            Bar *bar = baraaGetBar(sc->singleBaraa, si, bi);
+            if (!bar) continue;
+            if (bar->keySig && bar->keySig->count > 0) {
+                gks_type = bar->keySig->type;
+                gks_count = bar->keySig->count;
+                break;
+            }
+        }
+    }
+
+    /* Collect events from all staves/bars */
+    MidiEvt *evts = NULL;
+    int nevt = 0, ecap = 0;
+    int total_notes = 0, total_bars = 0;
+    double cumul = 0;
+    double std_bar_ms = 4000.0;
+
+    for (int si = 0; si < nStaves; si++) {
+        int nb = baraaGetBarCount(sc->singleBaraa, si);
+        double staff_cumul = 0;
+        double staff_bar_ms = 4000.0;
+
+        for (int bi = 0; bi < nb; bi++) {
+            Bar *cur = baraaGetBar(sc->singleBaraa, si, bi);
+            if (!cur || cur->length <= 0) continue;
+
+            int kt = gks_type, kc = gks_count;
+            if (cur->keySig && cur->keySig->count > 0) {
+                kt = cur->keySig->type;
+                kc = cur->keySig->count;
+            }
+
+            for (int ti = 0; ti < 200; ti++) {
+                TimePoint *tp = barGetTP(cur, ti);
+                if (!tp) break;
+                for (int sni = 0; sni < 20; sni++) {
+                    Sound *snd = tpGetSound(tp, sni);
+                    if (!snd) break;
+                    if (snd->isRest) continue;
+
+                    int midi = pitchToMidi(snd->pitch);
+                    if (snd->pitch == snd->pitchNoAcc)
+                        midi = apply_keysig(midi, kt, kc);
+                    if (midi < 21 || midi > 108) continue;
+
+                    double dur_ms = snd->length > 0 ? snd->length : 500;
+                    int tick = (int)((staff_cumul + (tp->startTime - cur->offset)) * tpq / 1000.0);
+                    int dur = (int)(dur_ms * tpq / 1000.0);
+                    if (dur < 20) dur = 20;
+
+                    if (nevt + 2 > ecap) {
+                        ecap = ecap ? ecap * 2 : 4096;
+                        evts = realloc(evts, ecap * sizeof(MidiEvt));
+                    }
+                    evts[nevt++] = (MidiEvt){tick, midi, 1};
+                    evts[nevt++] = (MidiEvt){tick + dur - 10, midi, 0};
+                    total_notes++;
+                }
+            }
+
+            if (cur->timeSig) {
+                int num = ((int *)cur->timeSig)[1];
+                int den = ((int *)cur->timeSig)[2];
+                if (num > 0 && den > 0)
+                    staff_bar_ms = num * (4.0 / den) * 1000.0;
+            }
+            staff_cumul += staff_bar_ms;
+            if (si == 0) total_bars++;
+        }
+    }
+
+    if (out_notes) *out_notes = total_notes;
+    if (out_bars) *out_bars = total_bars;
+
+    qsort(evts, nevt, sizeof(MidiEvt), cmp_evt);
+
+    /* Build MIDI buffer */
+    int uspqn = 60000000 / bpm;
+    MB tempo; mb_init(&tempo);
+    mb_var(&tempo, 0); mb_u8(&tempo, 0xff); mb_u8(&tempo, 0x51); mb_u8(&tempo, 3);
+    mb_u8(&tempo, (uspqn >> 16) & 0xff); mb_u8(&tempo, (uspqn >> 8) & 0xff); mb_u8(&tempo, uspqn & 0xff);
+    if (gks_count > 0) {
+        mb_var(&tempo, 0); mb_u8(&tempo, 0xff); mb_u8(&tempo, 0x59); mb_u8(&tempo, 2);
+        mb_u8(&tempo, (unsigned char)(gks_type == 0 ? -gks_count : gks_count));
+        mb_u8(&tempo, 0);
+    }
+    mb_var(&tempo, 0); mb_u8(&tempo, 0xff); mb_u8(&tempo, 0x58); mb_u8(&tempo, 4);
+    mb_u8(&tempo, 4); mb_u8(&tempo, 2); mb_u8(&tempo, 24); mb_u8(&tempo, 8);
+    mb_var(&tempo, 0); mb_u8(&tempo, 0xff); mb_u8(&tempo, 0x2f); mb_u8(&tempo, 0);
+
+    MB trk; mb_init(&trk);
+    const char *tname = "Piano";
+    mb_var(&trk, 0); mb_u8(&trk, 0xff); mb_u8(&trk, 0x03); mb_u8(&trk, 5);
+    for (int i = 0; i < 5; i++) mb_u8(&trk, tname[i]);
+    mb_var(&trk, 0); mb_u8(&trk, 0xc0); mb_u8(&trk, 0);
+
+    int last = 0;
+    for (int i = 0; i < nevt; i++) {
+        int dt = evts[i].tick - last;
+        if (dt < 0) dt = 0;
+        mb_note(&trk, dt, evts[i].on, 0, evts[i].midi, evts[i].on ? 80 : 0);
+        last = evts[i].tick;
+    }
+    mb_var(&trk, 0); mb_u8(&trk, 0xff); mb_u8(&trk, 0x2f); mb_u8(&trk, 0);
+
+    int total_len = 14 + 8 + tempo.len + 8 + trk.len;
+    unsigned char *midi = malloc(total_len);
+    int pos = 0;
+    unsigned char mthd[14] = {'M','T','h','d', 0,0,0,6, 0,1, 0,2,
+                              (tpq >> 8) & 0xff, tpq & 0xff};
+    memcpy(midi + pos, mthd, 14); pos += 14;
+    unsigned char th[8] = {'M','T','r','k',
+        (tempo.len >> 24) & 0xff, (tempo.len >> 16) & 0xff,
+        (tempo.len >> 8) & 0xff, tempo.len & 0xff};
+    memcpy(midi + pos, th, 8); pos += 8;
+    memcpy(midi + pos, tempo.d, tempo.len); pos += tempo.len;
+    unsigned char h[8] = {'M','T','r','k',
+        (trk.len >> 24) & 0xff, (trk.len >> 16) & 0xff,
+        (trk.len >> 8) & 0xff, trk.len & 0xff};
+    memcpy(midi + pos, h, 8); pos += 8;
+    memcpy(midi + pos, trk.d, trk.len); pos += trk.len;
+
+    result.data = midi;
+    result.len = total_len;
+
+    free(evts);
+    free(tempo.d);
+    free(trk.d);
+    return result;
+}
+
 /* --- Main analysis function --- */
 SmsResult sms_analyze(void **pix_pages, int num_pages,
                       sms_log_fn log_cb, sms_progress_fn progress_cb,
+                      sms_page_done_fn page_done_cb,
                       void *userdata) {
     SmsResult res = {0};
 
     g_log_cb = log_cb;
     g_progress_cb = progress_cb;
+    g_page_done_cb = page_done_cb;
     g_userdata = userdata;
 
     if (num_pages < 1 || !pix_pages) {
@@ -275,7 +425,12 @@ SmsResult sms_analyze(void **pix_pages, int num_pages,
     /* Session-based multi-page analysis */
     void *session = NULL;
     Score *score = NULL;
+    Score **scores = calloc(num_pages, sizeof(Score *));
     g_total_pages = num_pages;
+
+    /* Allocate per-page MIDI array */
+    res.page_midis = calloc(num_pages, sizeof(SmsMidi));
+    res.num_pages = num_pages;
 
     for (int page = 0; page < num_pages; page++) {
         g_cur_page = page;
@@ -311,200 +466,172 @@ SmsResult sms_analyze(void **pix_pages, int num_pages,
             session = sessionCreate(1);
         }
         sessionAdd(session, score);
+        scores[page] = score;
 
-        /* Count notes in this page */
-        {
-            int pn = 0;
-            for (int si = 0; si < 20; si++) {
-                int nb = baraaGetBarCount(score->singleBaraa, si);
-                if (nb <= 0) break;
-                for (int bi = 0; bi < nb; bi++) {
-                    Bar *b = baraaGetBar(score->singleBaraa, si, bi);
-                    if (!b) continue;
-                    for (int ti = 0; ti < 200; ti++) {
-                        TimePoint *tp = barGetTP(b, ti);
-                        if (!tp) break;
-                        for (int sni = 0; sni < 20; sni++) {
-                            Sound *s = tpGetSound(tp, sni);
-                            if (!s) break;
-                            if (!s->isRest) pn++;
-                        }
-                    }
-                }
-            }
-            sms_log("  Page %d: %d notes", page + 1, pn);
+        /* Build per-page MIDI */
+        int pn = 0;
+        res.page_midis[page] = build_midi_from_score(score, tpq, bpm, &pn, NULL);
+        sms_log("  Page %d: %d notes, %d bytes MIDI", page + 1, pn, res.page_midis[page].len);
+
+        /* Notify caller immediately with this page's MIDI */
+        if (g_page_done_cb) {
+            g_page_done_cb(page, num_pages,
+                           res.page_midis[page].data, res.page_midis[page].len,
+                           pn, g_userdata);
         }
     }
 
     if (!score) {
         res.result_code = 5;
         snprintf(res.error_msg, sizeof(res.error_msg), "no score produced");
+        free(scores);
         return res;
     }
 
-    /* 5. Collect MIDI events using unified session */
-    int gks_type = 1, gks_count = 0, nStaves = 0;
-    Score *sc0 = sessionGet(session, 0);
-    if (sc0) {
-        for (int i = 0; i < 20; i++) { if (baraaGetBarCount(sc0->singleBaraa, i) <= 0) break; nStaves++; }
-        for (int si = 0; si < nStaves && gks_count == 0; si++) {
-            int nb = baraaGetBarCount(sc0->singleBaraa, si);
-            for (int bi = 0; bi < nb; bi++) {
-                Bar *bar = baraaGetBar(sc0->singleBaraa, si, bi);
-                if (!bar) continue;
-                if (bar->keySig && bar->keySig->count > 0) {
-                    gks_type = bar->keySig->type;
-                    gks_count = bar->keySig->count;
-                    break;
-                }
+    /* Build merged MIDI from all scores combined.
+     * We concatenate events from all pages sequentially. */
+    {
+        MidiEvt *evts = NULL;
+        int nevt = 0, ecap = 0;
+        double page_offset = 0;
+
+        for (int pg = 0; pg < num_pages; pg++) {
+            Score *sc = scores[pg];
+            if (!sc) continue;
+
+            int nSt = 0;
+            for (int i = 0; i < 20; i++) {
+                if (baraaGetBarCount(sc->singleBaraa, i) <= 0) break;
+                nSt++;
             }
-        }
-    }
-    res.num_staves = nStaves;
-
-    /* Find first non-empty group bar */
-    Bar *firstBar = NULL;
-    for (int gi = 0; gi < 20 && !firstBar; gi++) {
-        int nb = baraaGetBarCount(sc0->groupBaraa, gi);
-        if (nb <= 0) break;
-        for (int bi = 0; bi < nb; bi++) {
-            Bar *bar = baraaGetBar(sc0->groupBaraa, gi, bi);
-            if (bar && bar->length > 0) { firstBar = bar; break; }
-        }
-    }
-
-    MidiEvt *evts = NULL;
-    int nevt = 0, ecap = 0;
-
-    if (firstBar) {
-        sessionStateSetCurrentBar(session, sc0, firstBar, -1);
-        Bar *cur = firstBar;
-        double cumul = 0;
-
-        while (cur && res.total_bars < 500) {
-            if (cur->length <= 0) {
-                PlayerListNode *node = sessionStateMoveToNextBar(session);
-                if (!node) break;
-                cur = node->bar;
-                continue;
-            }
-
-            int kt = gks_type, kc = gks_count;
-            if (cur->keySig && cur->keySig->count > 0) {
-                kt = cur->keySig->type;
-                kc = cur->keySig->count;
-            }
-
-            for (int ti = 0; ti < 200; ti++) {
-                TimePoint *tp = barGetTP(cur, ti);
-                if (!tp) break;
-
-                for (int sni = 0; sni < 20; sni++) {
-                    Sound *snd = tpGetSound(tp, sni);
-                    if (!snd) break;
-                    if (snd->isRest) continue;
-
-                    int midi = pitchToMidi(snd->pitch);
-                    if (snd->pitch == snd->pitchNoAcc)
-                        midi = apply_keysig(midi, kt, kc);
-                    if (midi < 21 || midi > 108) continue;
-
-                    double dur_ms = snd->length > 0 ? snd->length : 500;
-                    int tick = (int)((cumul + (tp->startTime - cur->offset)) * tpq / 1000.0);
-                    int dur = (int)(dur_ms * tpq / 1000.0);
-                    if (dur < 20) dur = 20;
-
-                    if (nevt + 2 > ecap) {
-                        ecap = ecap ? ecap * 2 : 8192;
-                        evts = realloc(evts, ecap * sizeof(MidiEvt));
+            int gks_t = 1, gks_c = 0;
+            for (int si = 0; si < nSt && gks_c == 0; si++) {
+                int nb = baraaGetBarCount(sc->singleBaraa, si);
+                for (int bi = 0; bi < nb; bi++) {
+                    Bar *bar = baraaGetBar(sc->singleBaraa, si, bi);
+                    if (!bar) continue;
+                    if (bar->keySig && bar->keySig->count > 0) {
+                        gks_t = bar->keySig->type;
+                        gks_c = bar->keySig->count;
+                        break;
                     }
-                    evts[nevt++] = (MidiEvt){tick, midi, 1};
-                    evts[nevt++] = (MidiEvt){tick + dur - 10, midi, 0};
-                    res.total_notes++;
                 }
             }
+            if (pg == 0) res.num_staves = nSt;
 
-            static double std_bar_ms = 4000.0;
-            if (cur->timeSig) {
-                int num = ((int *)cur->timeSig)[1];
-                int den = ((int *)cur->timeSig)[2];
-                if (num > 0 && den > 0)
-                    std_bar_ms = num * (4.0 / den) * 1000.0;
+            double page_dur = 0;
+            for (int si = 0; si < nSt; si++) {
+                int nb = baraaGetBarCount(sc->singleBaraa, si);
+                double staff_cumul = 0;
+                double staff_bar_ms = 4000.0;
+
+                for (int bi = 0; bi < nb; bi++) {
+                    Bar *cur = baraaGetBar(sc->singleBaraa, si, bi);
+                    if (!cur || cur->length <= 0) continue;
+
+                    int kt = gks_t, kc = gks_c;
+                    if (cur->keySig && cur->keySig->count > 0) {
+                        kt = cur->keySig->type;
+                        kc = cur->keySig->count;
+                    }
+
+                    for (int ti = 0; ti < 200; ti++) {
+                        TimePoint *tp = barGetTP(cur, ti);
+                        if (!tp) break;
+                        for (int sni = 0; sni < 20; sni++) {
+                            Sound *snd = tpGetSound(tp, sni);
+                            if (!snd) break;
+                            if (snd->isRest) continue;
+
+                            int midi = pitchToMidi(snd->pitch);
+                            if (snd->pitch == snd->pitchNoAcc)
+                                midi = apply_keysig(midi, kt, kc);
+                            if (midi < 21 || midi > 108) continue;
+
+                            double dur_ms = snd->length > 0 ? snd->length : 500;
+                            int tick = (int)((page_offset + staff_cumul + (tp->startTime - cur->offset)) * tpq / 1000.0);
+                            int dur = (int)(dur_ms * tpq / 1000.0);
+                            if (dur < 20) dur = 20;
+
+                            if (nevt + 2 > ecap) {
+                                ecap = ecap ? ecap * 2 : 8192;
+                                evts = realloc(evts, ecap * sizeof(MidiEvt));
+                            }
+                            evts[nevt++] = (MidiEvt){tick, midi, 1};
+                            evts[nevt++] = (MidiEvt){tick + dur - 10, midi, 0};
+                            res.total_notes++;
+                        }
+                    }
+
+                    if (cur->timeSig) {
+                        int num = ((int *)cur->timeSig)[1];
+                        int den = ((int *)cur->timeSig)[2];
+                        if (num > 0 && den > 0)
+                            staff_bar_ms = num * (4.0 / den) * 1000.0;
+                    }
+                    staff_cumul += staff_bar_ms;
+                    if (si == 0) {
+                        res.total_bars++;
+                        if (staff_cumul > page_dur) page_dur = staff_cumul;
+                    }
+                }
             }
-            cumul += std_bar_ms;
-            res.total_bars++;
-            PlayerListNode *node = sessionStateMoveToNextBar(session);
-            if (!node) break;
-            cur = node->bar;
+            page_offset += page_dur;
         }
+
+        sms_log("Bars: %d, Notes: %d", res.total_bars, res.total_notes);
+        qsort(evts, nevt, sizeof(MidiEvt), cmp_evt);
+
+        /* Build merged MIDI buffer */
+        int uspqn = 60000000 / bpm;
+        MB tempo; mb_init(&tempo);
+        mb_var(&tempo, 0); mb_u8(&tempo, 0xff); mb_u8(&tempo, 0x51); mb_u8(&tempo, 3);
+        mb_u8(&tempo, (uspqn >> 16) & 0xff); mb_u8(&tempo, (uspqn >> 8) & 0xff); mb_u8(&tempo, uspqn & 0xff);
+        mb_var(&tempo, 0); mb_u8(&tempo, 0xff); mb_u8(&tempo, 0x58); mb_u8(&tempo, 4);
+        mb_u8(&tempo, 4); mb_u8(&tempo, 2); mb_u8(&tempo, 24); mb_u8(&tempo, 8);
+        mb_var(&tempo, 0); mb_u8(&tempo, 0xff); mb_u8(&tempo, 0x2f); mb_u8(&tempo, 0);
+
+        MB trk; mb_init(&trk);
+        const char *tname = "Piano";
+        mb_var(&trk, 0); mb_u8(&trk, 0xff); mb_u8(&trk, 0x03); mb_u8(&trk, 5);
+        for (int i = 0; i < 5; i++) mb_u8(&trk, tname[i]);
+        mb_var(&trk, 0); mb_u8(&trk, 0xc0); mb_u8(&trk, 0);
+
+        int last = 0;
+        for (int i = 0; i < nevt; i++) {
+            int dt = evts[i].tick - last;
+            if (dt < 0) dt = 0;
+            mb_note(&trk, dt, evts[i].on, 0, evts[i].midi, evts[i].on ? 80 : 0);
+            last = evts[i].tick;
+        }
+        mb_var(&trk, 0); mb_u8(&trk, 0xff); mb_u8(&trk, 0x2f); mb_u8(&trk, 0);
+
+        int total_len = 14 + 8 + tempo.len + 8 + trk.len;
+        unsigned char *midi = malloc(total_len);
+        int pos = 0;
+        unsigned char mthd[14] = {'M','T','h','d', 0,0,0,6, 0,1, 0,2,
+                                  (tpq >> 8) & 0xff, tpq & 0xff};
+        memcpy(midi + pos, mthd, 14); pos += 14;
+        unsigned char th[8] = {'M','T','r','k',
+            (tempo.len >> 24) & 0xff, (tempo.len >> 16) & 0xff,
+            (tempo.len >> 8) & 0xff, tempo.len & 0xff};
+        memcpy(midi + pos, th, 8); pos += 8;
+        memcpy(midi + pos, tempo.d, tempo.len); pos += tempo.len;
+        unsigned char h[8] = {'M','T','r','k',
+            (trk.len >> 24) & 0xff, (trk.len >> 16) & 0xff,
+            (trk.len >> 8) & 0xff, trk.len & 0xff};
+        memcpy(midi + pos, h, 8); pos += 8;
+        memcpy(midi + pos, trk.d, trk.len); pos += trk.len;
+
+        res.midi_data = midi;
+        res.midi_len = total_len;
+
+        free(evts);
+        free(tempo.d);
+        free(trk.d);
     }
-    sms_log("Bars: %d (with repeats)", res.total_bars);
 
-    qsort(evts, nevt, sizeof(MidiEvt), cmp_evt);
-
-    /* 7. Build MIDI in memory */
-    MB tempo; mb_init(&tempo);
-    int uspqn = 60000000 / bpm;
-    mb_var(&tempo, 0); mb_u8(&tempo, 0xff); mb_u8(&tempo, 0x51); mb_u8(&tempo, 3);
-    mb_u8(&tempo, (uspqn >> 16) & 0xff); mb_u8(&tempo, (uspqn >> 8) & 0xff); mb_u8(&tempo, uspqn & 0xff);
-    if (gks_count > 0) {
-        mb_var(&tempo, 0); mb_u8(&tempo, 0xff); mb_u8(&tempo, 0x59); mb_u8(&tempo, 2);
-        mb_u8(&tempo, (unsigned char)(gks_type == 0 ? -gks_count : gks_count));
-        mb_u8(&tempo, 0);
-    }
-    mb_var(&tempo, 0); mb_u8(&tempo, 0xff); mb_u8(&tempo, 0x58); mb_u8(&tempo, 4);
-    mb_u8(&tempo, 4); mb_u8(&tempo, 2); mb_u8(&tempo, 24); mb_u8(&tempo, 8);
-    mb_var(&tempo, 0); mb_u8(&tempo, 0xff); mb_u8(&tempo, 0x2f); mb_u8(&tempo, 0);
-
-    MB trk; mb_init(&trk);
-    const char *tname = "Piano";
-    mb_var(&trk, 0); mb_u8(&trk, 0xff); mb_u8(&trk, 0x03); mb_u8(&trk, 5);
-    for (int i = 0; i < 5; i++) mb_u8(&trk, tname[i]);
-    mb_var(&trk, 0); mb_u8(&trk, 0xc0); mb_u8(&trk, 0);
-
-    int last = 0;
-    for (int i = 0; i < nevt; i++) {
-        int dt = evts[i].tick - last;
-        if (dt < 0) dt = 0;
-        mb_note(&trk, dt, evts[i].on, 0, evts[i].midi, evts[i].on ? 80 : 0);
-        last = evts[i].tick;
-    }
-    mb_var(&trk, 0); mb_u8(&trk, 0xff); mb_u8(&trk, 0x2f); mb_u8(&trk, 0);
-
-    /* Assemble final MIDI buffer: MThd + tempo track + note track */
-    int total_len = 14 + 8 + tempo.len + 8 + trk.len;
-    unsigned char *midi = malloc(total_len);
-    int pos = 0;
-
-    /* MThd header */
-    unsigned char mthd[14] = {'M','T','h','d', 0,0,0,6, 0,1, 0,2,
-                              (tpq >> 8) & 0xff, tpq & 0xff};
-    memcpy(midi + pos, mthd, 14); pos += 14;
-
-    /* Tempo track chunk */
-    unsigned char th[8] = {'M','T','r','k',
-        (tempo.len >> 24) & 0xff, (tempo.len >> 16) & 0xff,
-        (tempo.len >> 8) & 0xff, tempo.len & 0xff};
-    memcpy(midi + pos, th, 8); pos += 8;
-    memcpy(midi + pos, tempo.d, tempo.len); pos += tempo.len;
-
-    /* Note track chunk */
-    unsigned char h[8] = {'M','T','r','k',
-        (trk.len >> 24) & 0xff, (trk.len >> 16) & 0xff,
-        (trk.len >> 8) & 0xff, trk.len & 0xff};
-    memcpy(midi + pos, h, 8); pos += 8;
-    memcpy(midi + pos, trk.d, trk.len); pos += trk.len;
-
-    res.midi_data = midi;
-    res.midi_len = total_len;
-
-    const char *ks_names[] = {"flats", "none", "sharps"};
-    sms_log("Done: %d notes, %d staves, keySig=%d %s",
-        res.total_notes, nStaves, gks_count,
-        gks_count > 0 ? ks_names[gks_type < 3 ? gks_type : 1] : "");
-
-    free(evts);
-    free(tempo.d);
-    free(trk.d);
+    sms_log("Done: %d notes, %d bars, %d staves", res.total_notes, res.total_bars, res.num_staves);
+    free(scores);
     return res;
 }

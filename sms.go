@@ -66,7 +66,8 @@ func (p *Pix) Free() {
 
 // AnalyzeResult holds the analysis output.
 type AnalyzeResult struct {
-	MIDI       []byte
+	MIDI       []byte   // merged MIDI of all pages
+	PageMIDIs  [][]byte // per-page MIDI
 	TotalNotes int
 	TotalBars  int
 	NumStaves  int
@@ -84,22 +85,28 @@ func EngineInit() error {
 // Analyze runs the SMS engine on pre-loaded PIX pages
 // and returns the MIDI data as a byte slice.
 // If progress is non-nil, progress events are sent to it during analysis.
-// The channel is closed when Analyze returns.
-func Analyze(pages []*Pix, progress chan<- Progress) (*AnalyzeResult, error) {
+// If pageDone is non-nil, per-page MIDI is sent as each page completes.
+// Both channels are closed when Analyze returns.
+func Analyze(pages []*Pix, progress chan<- Progress, pageDone chan<- PageDone) (*AnalyzeResult, error) {
 	if len(pages) == 0 {
 		return nil, fmt.Errorf("no input pages")
 	}
 
-	// Register progress channel for the C callback
+	// Register channels for C callbacks
 	progressMu.Lock()
 	progressCh = progress
+	pageDoneCh = pageDone
 	progressMu.Unlock()
 	defer func() {
 		progressMu.Lock()
 		progressCh = nil
+		pageDoneCh = nil
 		progressMu.Unlock()
 		if progress != nil {
 			close(progress)
+		}
+		if pageDone != nil {
+			close(pageDone)
 		}
 	}()
 
@@ -118,13 +125,32 @@ func Analyze(pages []*Pix, progress chan<- Progress) (*AnalyzeResult, error) {
 			int(result.result_code), C.GoString(&result.error_msg[0]))
 	}
 
+	// Copy merged MIDI
 	midiLen := int(result.midi_len)
 	midi := make([]byte, midiLen)
 	copy(midi, unsafe.Slice((*byte)(unsafe.Pointer(result.midi_data)), midiLen))
 	C.free(unsafe.Pointer(result.midi_data))
 
+	// Copy per-page MIDIs
+	numPages := int(result.num_pages)
+	pageMIDIs := make([][]byte, numPages)
+	if result.page_midis != nil {
+		cPageMidis := unsafe.Slice(result.page_midis, numPages)
+		for i := 0; i < numPages; i++ {
+			pm := cPageMidis[i]
+			if pm.data != nil && pm.len > 0 {
+				pmLen := int(pm.len)
+				pageMIDIs[i] = make([]byte, pmLen)
+				copy(pageMIDIs[i], unsafe.Slice((*byte)(unsafe.Pointer(pm.data)), pmLen))
+				C.free(unsafe.Pointer(pm.data))
+			}
+		}
+		C.free(unsafe.Pointer(result.page_midis))
+	}
+
 	return &AnalyzeResult{
 		MIDI:       midi,
+		PageMIDIs:  pageMIDIs,
 		TotalNotes: int(result.total_notes),
 		TotalBars:  int(result.total_bars),
 		NumStaves:  int(result.num_staves),

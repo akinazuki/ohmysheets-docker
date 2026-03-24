@@ -15,15 +15,24 @@ import (
 type Progress struct {
 	Page       int    // 0-based page index
 	TotalPages int    // total number of pages
-	Stage      int    // analysis stage (2-7)
+	Stage      int    // analysis stage (2-8)
 	Name       string // human-readable stage name, may be empty
 }
 
-// Global progress channel, protected by mutex.
+// PageDone is sent when a page's analysis is complete, with its MIDI data.
+type PageDone struct {
+	Page       int    // 0-based page index
+	TotalPages int    // total number of pages
+	MIDI       []byte // per-page MIDI data
+	Notes      int    // number of notes in this page
+}
+
+// Global channels, protected by mutex.
 // Set by Analyze before calling C, cleared after.
 var (
 	progressMu sync.Mutex
 	progressCh chan<- Progress
+	pageDoneCh chan<- PageDone
 )
 
 //export goLogCallback
@@ -52,5 +61,30 @@ func goProgressCallback(page C.int, totalPages C.int, stage C.int, name *C.char,
 		case ch <- p:
 		default: // non-blocking: drop if consumer is slow
 		}
+	}
+}
+
+//export goPageDoneCallback
+func goPageDoneCallback(page C.int, totalPages C.int, midiData *C.uchar, midiLen C.int, notes C.int, _ unsafe.Pointer) {
+	progressMu.Lock()
+	ch := pageDoneCh
+	progressMu.Unlock()
+
+	if ch == nil {
+		return
+	}
+
+	// Copy MIDI data into Go memory (C data is only valid during this call)
+	midi := make([]byte, int(midiLen))
+	copy(midi, unsafe.Slice((*byte)(unsafe.Pointer(midiData)), int(midiLen)))
+
+	select {
+	case ch <- PageDone{
+		Page:       int(page),
+		TotalPages: int(totalPages),
+		MIDI:       midi,
+		Notes:      int(notes),
+	}:
+	default:
 	}
 }

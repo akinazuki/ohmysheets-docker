@@ -2,16 +2,25 @@
 #define SMS_LIB_H
 
 typedef void (*sms_log_fn)(const char *msg, void *userdata);
-/* stage: 2-7 per page, page/total_pages: 0-based page index */
+/* stage: 2-8 per page, page/total_pages: 0-based page index */
 typedef void (*sms_progress_fn)(int page, int total_pages, int stage, const char *name, void *userdata);
+/* Called when a page is fully analyzed. midi_data is valid only during the call (caller copies if needed). */
+typedef void (*sms_page_done_fn)(int page, int total_pages, const unsigned char *midi_data, int midi_len, int notes, void *userdata);
+
+typedef struct {
+    unsigned char *data;  /* caller must free() */
+    int len;
+} SmsMidi;
 
 typedef struct {
     int result_code;     /* 0 = success */
     int total_notes;
     int total_bars;
     int num_staves;
-    unsigned char *midi_data; /* caller must free() */
+    unsigned char *midi_data; /* merged MIDI, caller must free() */
     int midi_len;
+    SmsMidi *page_midis;  /* per-page MIDI array [num_pages], caller must free each .data and the array */
+    int num_pages;
     char error_msg[256];
 } SmsResult;
 
@@ -40,6 +49,7 @@ void sms_pix_free(void *pix);
  * Result contains midi_data/midi_len — caller must free(midi_data). */
 SmsResult sms_analyze(void **pix_pages, int num_pages,
                       sms_log_fn log_cb, sms_progress_fn progress_cb,
+                      sms_page_done_fn page_done_cb,
                       void *userdata);
 
 #endif

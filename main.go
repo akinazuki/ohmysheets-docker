@@ -77,7 +77,7 @@ func runCLI(args []string) {
 		}
 	}()
 
-	res, err := Analyze(pages, progCh)
+	res, err := Analyze(pages, progCh, nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -198,23 +198,44 @@ func handleAnalyze(c *gin.Context) {
 		pages = append(pages, pix)
 	}
 
-	// Progress channel → SSE
+	// Progress & page-done channels → SSE
 	progCh := make(chan Progress, 16)
+	pdCh := make(chan PageDone, 4)
 	done := make(chan struct{})
+
 	go func() {
-		for p := range progCh {
-			writeSSE("progress", gin.H{
-				"page":        p.Page,
-				"total_pages": p.TotalPages,
-				"stage":       p.Stage,
-				"name":        p.Name,
-			})
+		progOpen, pdOpen := true, true
+		for progOpen || pdOpen {
+			select {
+			case p, ok := <-progCh:
+				if !ok {
+					progOpen = false
+					continue
+				}
+				writeSSE("progress", gin.H{
+					"page":        p.Page,
+					"total_pages": p.TotalPages,
+					"stage":       p.Stage,
+					"name":        p.Name,
+				})
+			case pd, ok := <-pdCh:
+				if !ok {
+					pdOpen = false
+					continue
+				}
+				writeSSE("page_done", gin.H{
+					"page":        pd.Page,
+					"total_pages": pd.TotalPages,
+					"notes":       pd.Notes,
+					"midi":        base64.StdEncoding.EncodeToString(pd.MIDI),
+				})
+			}
 		}
 		close(done)
 	}()
 
-	res, err := Analyze(pages, progCh)
-	<-done // wait for all progress events to be flushed
+	res, err := Analyze(pages, progCh, pdCh)
+	<-done // wait for all SSE events to be flushed
 
 	if err != nil {
 		writeSSE("error", gin.H{"error": err.Error()})
