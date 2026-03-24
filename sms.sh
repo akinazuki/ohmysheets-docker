@@ -77,7 +77,7 @@ PAGE_FILES=()
 
 if [ -d "$INPUT" ]; then
     # Directory: collect all image files sorted
-    echo "Multi-page mode: $INPUT"
+    # echo "Multi-page mode: $INPUT"
     while IFS= read -r f; do
         PAGE_FILES+=("$f")
     done < <(find "$INPUT" -maxdepth 1 -type f \( -iname "*.png" -o -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.heic" -o -iname "*.heif" -o -iname "*.bmp" -o -iname "*.tiff" \) | sort)
@@ -97,7 +97,7 @@ for i in "${!PAGE_FILES[@]}"; do
     DST="$TMPDIR/page_${i}.png"
     prepare_image "${PAGE_FILES[$i]}" "$DST"
     upscale_if_needed "$DST"
-    echo "  Page $((i+1))/${#PAGE_FILES[@]}: $(basename "${PAGE_FILES[$i]}")"
+    # echo "  Page $((i+1))/${#PAGE_FILES[@]}: $(basename "${PAGE_FILES[$i]}")"
     DOCKER_ARGS+=("/app/pages/page_${i}.png")
 done
 

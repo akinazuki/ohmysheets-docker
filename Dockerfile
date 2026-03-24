@@ -1,7 +1,7 @@
 FROM arm64v8/debian:bookworm-slim
 
 RUN apt-get update -qq && \
-    apt-get install -qq -y gcc libc6-dev zlib1g-dev binutils python3 && \
+    apt-get install -qq -y gcc libc6-dev zlib1g-dev binutils python3 golang-go && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -17,14 +17,17 @@ COPY assets/nnModels/ /app/assets/nnModels/
 COPY assets/templates/ /app/assets/templates/
 
 # Source code
-COPY stubs.c sms.c /app/
+# stubs.c goes to a separate dir (compiled as .so, must NOT be in cgo's scope)
+# sms.c is the legacy standalone CLI, kept for reference only
+COPY stubs.c /app/compat/
+COPY sms_lib.h sms_lib.c bridge.c sms.go callback.go main.go go.mod /app/
 
 # Patch ELF binaries and build
 #   1. patch_elf.py: zero .gnu.version, null DT_VERNEED/DT_VERNEEDNUM
 #   2. objcopy: remove .note.android.ident section
 #   3. Symlink glibc system libs into the lib directory
 #   4. Build Bionic compat stubs (libandroid_stubs.so)
-#   5. Build the CLI binary
+#   5. Build the Go binary (cgo compiles sms_lib.c + bridge.c automatically)
 RUN set -e && \
     LIB=/app/lib && \
     python3 /app/patch_elf.py $LIB/*.so && \
@@ -33,12 +36,10 @@ RUN set -e && \
     ln -sf /lib/aarch64-linux-gnu/libm.so.6 $LIB/libm.so && \
     ln -sf /lib/aarch64-linux-gnu/libdl.so.2 $LIB/libdl.so && \
     ln -sf /lib/aarch64-linux-gnu/libz.so.1 $LIB/libz.so && \
-    gcc -shared -fPIC -o $LIB/libandroid_stubs.so /app/stubs.c -ldl && \
+    gcc -shared -fPIC -o $LIB/libandroid_stubs.so /app/compat/stubs.c -ldl && \
     ln -sf libandroid_stubs.so $LIB/liblog.so && \
     ln -sf libandroid_stubs.so $LIB/libjnigraphics.so && \
-    gcc -o /app/sms /app/sms.c \
-        -L$LIB -landroid_stubs -lsource-lib -llept -ljpgt -lpngt \
-        -ldl -lm -Wl,-rpath,$LIB
+    cd /app && CGO_ENABLED=1 go build -o /app/sms .
 
 RUN mkdir -p /app/assets /app/output
 
