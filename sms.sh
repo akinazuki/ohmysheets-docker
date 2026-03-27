@@ -125,23 +125,32 @@ for i in "${!PAGE_FILES[@]}"; do
     DOCKER_ARGS+=("/app/pages/page_${i}.png")
 done
 
-# Output path
-if [ -d "$INPUT" ]; then
-    OUTPUT="${2:-$(cd "$INPUT" && pwd)/output.mid}"
-else
-    OUTPUT="${2:-${INPUT%.*}.mid}"
+# Output path & format detection
+OUTPUT="$2"
+if [ -z "$OUTPUT" ]; then
+    if [ -d "$INPUT" ]; then
+        OUTPUT="$(cd "$INPUT" && pwd)/output.mid"
+    else
+        OUTPUT="${INPUT%.*}.mid"
+    fi
 fi
+# Detect format from output extension
+case "${OUTPUT##*.}" in
+    musicxml|xml) OUT_EXT="${OUTPUT##*.}" ;;
+    *)            OUT_EXT="mid" ;;
+esac
 
 # Run in Docker: mount pages dir + output dir
 docker run --rm --platform linux/arm64/v8 \
     -v "$TMPDIR:/app/pages:ro" \
     -v "$TMPDIR:/app/output" \
     "$IMAGE_NAME" \
-    "${DOCKER_ARGS[@]}" /app/output/result.mid 2>&1
+    "${DOCKER_ARGS[@]}" "/app/output/result.${OUT_EXT}" 2>&1
 
 # Copy output
-if [ -f "$TMPDIR/result.mid" ]; then
-    cp "$TMPDIR/result.mid" "$OUTPUT"
+RESULT="$TMPDIR/result.${OUT_EXT}"
+if [ -f "$RESULT" ]; then
+    cp "$RESULT" "$OUTPUT"
     echo ""
     echo "Output: $OUTPUT"
 
