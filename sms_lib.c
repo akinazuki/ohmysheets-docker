@@ -101,9 +101,14 @@ typedef AnalysisResult *(*analyze_fn)(void*, void*, void*, int, int, void*, void
 /* Session */
 extern void *sessionCreate(int);
 extern int sessionAdd(void *, Score *);
+extern int sessionAlignVoiceIndexes(void *, int);
 extern int sessionStateSetCurrentBar(void *, Score *, Bar *, int);
 extern PlayerListNode *sessionStateMoveToNextBar(void *);
 extern Score *sessionGet(void *, int);
+
+/* MusicXML export: writes to file path.
+ * voiceIndex=-1 exports all voices. */
+extern int exportToMusicXml(const char *, void *, const char *, const char *, int, int, int, int);
 
 /* --- Engine state --- */
 
@@ -466,6 +471,7 @@ SmsResult sms_analyze(void **pix_pages, int num_pages,
             session = sessionCreate(1);
         }
         sessionAdd(session, score);
+        sessionAlignVoiceIndexes(session, page > 0 ? page : 0);
         scores[page] = score;
 
         /* Build per-page MIDI */
@@ -488,95 +494,108 @@ SmsResult sms_analyze(void **pix_pages, int num_pages,
         return res;
     }
 
-    /* Build merged MIDI from all scores combined.
-     * We concatenate events from all pages sequentially. */
+    /* Build merged MIDI using session traversal (handles repeats & cross-page links).
+     * This matches the original sms.c logic using groupBaraa + sessionStateMoveToNextBar. */
     {
-        MidiEvt *evts = NULL;
-        int nevt = 0, ecap = 0;
-        double page_offset = 0;
+        Score *sc0 = sessionGet(session, 0);
+        int gks_type = 1, gks_count = 0, nStaves = 0;
 
-        for (int pg = 0; pg < num_pages; pg++) {
-            Score *sc = scores[pg];
-            if (!sc) continue;
-
-            int nSt = 0;
+        if (sc0) {
             for (int i = 0; i < 20; i++) {
-                if (baraaGetBarCount(sc->singleBaraa, i) <= 0) break;
-                nSt++;
+                if (baraaGetBarCount(sc0->singleBaraa, i) <= 0) break;
+                nStaves++;
             }
-            int gks_t = 1, gks_c = 0;
-            for (int si = 0; si < nSt && gks_c == 0; si++) {
-                int nb = baraaGetBarCount(sc->singleBaraa, si);
+            for (int si = 0; si < nStaves && gks_count == 0; si++) {
+                int nb = baraaGetBarCount(sc0->singleBaraa, si);
                 for (int bi = 0; bi < nb; bi++) {
-                    Bar *bar = baraaGetBar(sc->singleBaraa, si, bi);
+                    Bar *bar = baraaGetBar(sc0->singleBaraa, si, bi);
                     if (!bar) continue;
                     if (bar->keySig && bar->keySig->count > 0) {
-                        gks_t = bar->keySig->type;
-                        gks_c = bar->keySig->count;
+                        gks_type = bar->keySig->type;
+                        gks_count = bar->keySig->count;
                         break;
                     }
                 }
             }
-            if (pg == 0) res.num_staves = nSt;
+        }
+        res.num_staves = nStaves;
 
-            double page_dur = 0;
-            for (int si = 0; si < nSt; si++) {
-                int nb = baraaGetBarCount(sc->singleBaraa, si);
-                double staff_cumul = 0;
-                double staff_bar_ms = 4000.0;
+        /* Find first non-empty group bar */
+        Bar *firstBar = NULL;
+        for (int gi = 0; gi < 20 && !firstBar; gi++) {
+            int nb = baraaGetBarCount(sc0->groupBaraa, gi);
+            if (nb <= 0) break;
+            for (int bi = 0; bi < nb; bi++) {
+                Bar *bar = baraaGetBar(sc0->groupBaraa, gi, bi);
+                if (bar && bar->length > 0) { firstBar = bar; break; }
+            }
+        }
 
-                for (int bi = 0; bi < nb; bi++) {
-                    Bar *cur = baraaGetBar(sc->singleBaraa, si, bi);
-                    if (!cur || cur->length <= 0) continue;
+        MidiEvt *evts = NULL;
+        int nevt = 0, ecap = 0;
 
-                    int kt = gks_t, kc = gks_c;
-                    if (cur->keySig && cur->keySig->count > 0) {
-                        kt = cur->keySig->type;
-                        kc = cur->keySig->count;
-                    }
+        if (firstBar) {
+            sessionStateSetCurrentBar(session, sc0, firstBar, -1);
+            Bar *cur = firstBar;
+            double cumul = 0;
+            double std_bar_ms = 4000.0;
 
-                    for (int ti = 0; ti < 200; ti++) {
-                        TimePoint *tp = barGetTP(cur, ti);
-                        if (!tp) break;
-                        for (int sni = 0; sni < 20; sni++) {
-                            Sound *snd = tpGetSound(tp, sni);
-                            if (!snd) break;
-                            if (snd->isRest) continue;
+            while (cur && res.total_bars < 500) {
+                if (cur->length <= 0) {
+                    PlayerListNode *node = sessionStateMoveToNextBar(session);
+                    if (!node) break;
+                    cur = node->bar;
+                    continue;
+                }
 
-                            int midi = pitchToMidi(snd->pitch);
-                            if (snd->pitch == snd->pitchNoAcc)
-                                midi = apply_keysig(midi, kt, kc);
-                            if (midi < 21 || midi > 108) continue;
+                int kt = gks_type, kc = gks_count;
+                if (cur->keySig && cur->keySig->count > 0) {
+                    kt = cur->keySig->type;
+                    kc = cur->keySig->count;
+                }
 
-                            double dur_ms = snd->length > 0 ? snd->length : 500;
-                            int tick = (int)((page_offset + staff_cumul + (tp->startTime - cur->offset)) * tpq / 1000.0);
-                            int dur = (int)(dur_ms * tpq / 1000.0);
-                            if (dur < 20) dur = 20;
+                for (int ti = 0; ti < 200; ti++) {
+                    TimePoint *tp = barGetTP(cur, ti);
+                    if (!tp) break;
 
-                            if (nevt + 2 > ecap) {
-                                ecap = ecap ? ecap * 2 : 8192;
-                                evts = realloc(evts, ecap * sizeof(MidiEvt));
-                            }
-                            evts[nevt++] = (MidiEvt){tick, midi, 1};
-                            evts[nevt++] = (MidiEvt){tick + dur - 10, midi, 0};
-                            res.total_notes++;
+                    for (int sni = 0; sni < 20; sni++) {
+                        Sound *snd = tpGetSound(tp, sni);
+                        if (!snd) break;
+                        if (snd->isRest) continue;
+
+                        int midi = pitchToMidi(snd->pitch);
+                        if (snd->pitch == snd->pitchNoAcc)
+                            midi = apply_keysig(midi, kt, kc);
+                        if (midi < 21 || midi > 108) continue;
+
+                        double dur_ms = snd->length > 0 ? snd->length : 500;
+                        int tick = (int)((cumul + (tp->startTime - cur->offset)) * tpq / 1000.0);
+                        int dur = (int)(dur_ms * tpq / 1000.0);
+                        if (dur < 20) dur = 20;
+
+                        if (nevt + 2 > ecap) {
+                            ecap = ecap ? ecap * 2 : 8192;
+                            evts = realloc(evts, ecap * sizeof(MidiEvt));
                         }
-                    }
-
-                    if (cur->timeSig) {
-                        int num = ((int *)cur->timeSig)[1];
-                        int den = ((int *)cur->timeSig)[2];
-                        if (num > 0 && den > 0)
-                            staff_bar_ms = num * (4.0 / den) * 1000.0;
-                    }
-                    staff_cumul += staff_bar_ms;
-                    if (si == 0) {
-                        res.total_bars++;
-                        if (staff_cumul > page_dur) page_dur = staff_cumul;
+                        evts[nevt++] = (MidiEvt){tick, midi, 1};
+                        evts[nevt++] = (MidiEvt){tick + dur - 10, midi, 0};
+                        res.total_notes++;
                     }
                 }
+
+                if (cur->timeSig) {
+                    int num = ((int *)cur->timeSig)[1];
+                    int den = ((int *)cur->timeSig)[2];
+                    if (num > 0 && den > 0)
+                        std_bar_ms = num * (4.0 / den) * 1000.0;
+                }
+                cumul += std_bar_ms;
+                res.total_bars++;
+
+                PlayerListNode *node = sessionStateMoveToNextBar(session);
+                if (!node) break;
+                cur = node->bar;
             }
-            page_offset += page_dur;
         }
 
         sms_log("Bars: %d, Notes: %d", res.total_bars, res.total_notes);
@@ -587,6 +606,11 @@ SmsResult sms_analyze(void **pix_pages, int num_pages,
         MB tempo; mb_init(&tempo);
         mb_var(&tempo, 0); mb_u8(&tempo, 0xff); mb_u8(&tempo, 0x51); mb_u8(&tempo, 3);
         mb_u8(&tempo, (uspqn >> 16) & 0xff); mb_u8(&tempo, (uspqn >> 8) & 0xff); mb_u8(&tempo, uspqn & 0xff);
+        if (gks_count > 0) {
+            mb_var(&tempo, 0); mb_u8(&tempo, 0xff); mb_u8(&tempo, 0x59); mb_u8(&tempo, 2);
+            mb_u8(&tempo, (unsigned char)(gks_type == 0 ? -gks_count : gks_count));
+            mb_u8(&tempo, 0);
+        }
         mb_var(&tempo, 0); mb_u8(&tempo, 0xff); mb_u8(&tempo, 0x58); mb_u8(&tempo, 4);
         mb_u8(&tempo, 4); mb_u8(&tempo, 2); mb_u8(&tempo, 24); mb_u8(&tempo, 8);
         mb_var(&tempo, 0); mb_u8(&tempo, 0xff); mb_u8(&tempo, 0x2f); mb_u8(&tempo, 0);
@@ -631,7 +655,32 @@ SmsResult sms_analyze(void **pix_pages, int num_pages,
         free(trk.d);
     }
 
-    sms_log("Done: %d notes, %d bars, %d staves", res.total_notes, res.total_bars, res.num_staves);
+    /* Build MusicXML via the native export function (writes to tmpfile, read back) */
+    {
+        char tmppath[] = "/tmp/sms_xml_XXXXXX";
+        int tmpfd = mkstemp(tmppath);
+        if (tmpfd >= 0) {
+            close(tmpfd);
+            int ret = exportToMusicXml(tmppath, session, "Score", "Piano", 1, 0, bpm, -1);
+            if (ret == 0) {
+                FILE *f = fopen(tmppath, "rb");
+                if (f) {
+                    fseek(f, 0, SEEK_END);
+                    long sz = ftell(f);
+                    fseek(f, 0, SEEK_SET);
+                    if (sz > 0) {
+                        res.musicxml_data = malloc(sz);
+                        res.musicxml_len = (int)fread(res.musicxml_data, 1, sz, f);
+                    }
+                    fclose(f);
+                }
+            }
+            unlink(tmppath);
+        }
+    }
+
+    sms_log("Done: %d notes, %d bars, %d staves, %d bytes MusicXML",
+            res.total_notes, res.total_bars, res.num_staves, res.musicxml_len);
     free(scores);
     return res;
 }

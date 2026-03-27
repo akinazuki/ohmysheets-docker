@@ -91,6 +91,9 @@ extern TimePoint *barGetTP(Bar *, int);
 extern Sound *tpGetSound(TimePoint *, int);
 extern int pitchToMidi(int);
 
+/* MusicXML export: 8 args, last is voiceIndex (-1 = all voices) */
+extern int exportToMusicXml(const char *, void *, const char *, const char *, int, int, int, int);
+
 /* analyze():
  * x0: PIX* pix            - 32bpp RGB image
  * x1: loadTemplatesCb     - void* cb(int staffHeight)
@@ -105,19 +108,6 @@ extern int pitchToMidi(int);
 typedef AnalysisResult *(*analyze_fn)(void*, void*, void*, int, int, void*, void*, void*, double);
 
 /* --- Bionic compat (also in stubs.so, but needed for link) --- */
-extern char __sF[];
-static int logfd = 2;
-int fprintf(FILE *s, const char *f, ...) {
-    va_list a; va_start(a, f);
-    int r = vdprintf(logfd, f, a);
-    va_end(a); return r;
-}
-int printf(const char *f, ...) {
-    va_list a; va_start(a, f);
-    int r = vdprintf(logfd, f, a);
-    va_end(a); return r;
-}
-int fflush(FILE *s) { return 0; }
 
 /* Template callback: receives staffHeight as int in w0 */
 void *tpl_cb(int h) {
@@ -190,19 +180,25 @@ int cmp_evt(const void *a, const void *b) {
 /* --- Main --- */
 int main(int argc, char **argv) {
     if (argc < 2) {
-        write(2, "Usage: sms <image> [image2 ...] [output.mid]\n"
+        write(2, "Usage: sms <image> [image2 ...] [output.mid|.musicxml]\n"
               "  Single page:  sms page.png out.mid\n"
-              "  Multi-page:   sms p0.png p1.png p2.png out.mid\n", 120);
+              "  Multi-page:   sms p0.png p1.png p2.png out.mid\n"
+              "  MusicXML:     sms page.png out.musicxml\n", 170);
         return 1;
     }
 
-    /* Parse args: images are all args except last .mid, or all args if no .mid */
+    /* Parse args: last arg ending in .mid/.musicxml/.xml is the output */
     int nPages = argc - 1;
-    const char *mid_path = "/app/docker_out/output.mid";
+    const char *out_path = "/app/docker_out/output.mid";
+    int out_musicxml = 0;
     int last_len = strlen(argv[argc - 1]);
     if (last_len > 4 && strcmp(argv[argc - 1] + last_len - 4, ".mid") == 0) {
-        mid_path = argv[argc - 1];
+        out_path = argv[argc - 1];
         nPages = argc - 2;
+    } else if (last_len > 4 && strcmp(argv[argc - 1] + last_len - 4, ".xml") == 0) {
+        out_path = argv[argc - 1]; nPages = argc - 2; out_musicxml = 1;
+    } else if (last_len > 9 && strcmp(argv[argc - 1] + last_len - 9, ".musicxml") == 0) {
+        out_path = argv[argc - 1]; nPages = argc - 2; out_musicxml = 1;
     }
     if (nPages < 1) { write(2, "Error: no input images\n", 23); return 1; }
 
@@ -231,6 +227,7 @@ int main(int argc, char **argv) {
     extern int sessionAdd(void *, Score *);
     extern int sessionStateSetCurrentBar(void *, Score *, Bar *, int);
     extern PlayerListNode *sessionStateMoveToNextBar(void *);
+    extern int sessionAlignVoiceIndexes(void *, int);
 
     void *session = NULL;
     Score *score = NULL;
@@ -290,6 +287,16 @@ int main(int argc, char **argv) {
     }
 
     if (!score) { LOG("Error: no score"); return 1; }
+
+    /* MusicXML export: use the native function directly */
+    if (out_musicxml) {
+        sessionAlignVoiceIndexes(session, 0);
+        LOG("Exporting MusicXML...");
+        int ret = exportToMusicXml(out_path, session, "Score", "Piano", 1, 0, bpm, -1);
+        if (ret != 0) { LOG("MusicXML export failed (%d)", ret); return 1; }
+        LOG("MusicXML: %s", out_path);
+        _exit(0);
+    }
 
     /* 5. Collect MIDI events using unified session (matching App behavior)
        App uses one session with all scores, traversed by sessionStateMoveToNextBar
@@ -406,8 +413,8 @@ int main(int argc, char **argv) {
     qsort(evts, nevt, sizeof(MidiEvt), cmp_evt);
 
     /* 7. Write MIDI file */
-    int fd = open(mid_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) { LOG("Error: cannot write %s", mid_path); return 1; }
+    int fd = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) { LOG("Error: cannot write %s", out_path); return 1; }
 
     unsigned char mthd[14] = {'M','T','h','d', 0,0,0,6, 0,1, 0,2,
                               (tpq >> 8) & 0xff, tpq & 0xff};
@@ -459,7 +466,7 @@ int main(int argc, char **argv) {
     LOG("Done: %d notes, %d staves, keySig=%d %s",
         total_notes, nStaves, gks_count,
         gks_count > 0 ? ks_names[gks_type < 3 ? gks_type : 1] : "");
-    LOG("MIDI: %s", mid_path);
+    LOG("MIDI: %s", out_path);
 
     free(evts); free(tempo.d);
     _exit(0);

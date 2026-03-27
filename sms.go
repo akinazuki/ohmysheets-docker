@@ -67,6 +67,7 @@ func (p *Pix) Free() {
 // AnalyzeResult holds the analysis output.
 type AnalyzeResult struct {
 	MIDI       []byte   // merged MIDI of all pages
+	MusicXML   []byte   // MusicXML 3.0 of all pages
 	PageMIDIs  [][]byte // per-page MIDI
 	TotalNotes int
 	TotalBars  int
@@ -131,6 +132,15 @@ func Analyze(pages []*Pix, progress chan<- Progress, pageDone chan<- PageDone) (
 	copy(midi, unsafe.Slice((*byte)(unsafe.Pointer(result.midi_data)), midiLen))
 	C.free(unsafe.Pointer(result.midi_data))
 
+	// Copy MusicXML
+	var musicxml []byte
+	if result.musicxml_data != nil && result.musicxml_len > 0 {
+		xmlLen := int(result.musicxml_len)
+		musicxml = make([]byte, xmlLen)
+		copy(musicxml, unsafe.Slice((*byte)(unsafe.Pointer(result.musicxml_data)), xmlLen))
+		C.free(unsafe.Pointer(result.musicxml_data))
+	}
+
 	// Copy per-page MIDIs
 	numPages := int(result.num_pages)
 	pageMIDIs := make([][]byte, numPages)
@@ -150,6 +160,7 @@ func Analyze(pages []*Pix, progress chan<- Progress, pageDone chan<- PageDone) (
 
 	return &AnalyzeResult{
 		MIDI:       midi,
+		MusicXML:   musicxml,
 		PageMIDIs:  pageMIDIs,
 		TotalNotes: int(result.total_notes),
 		TotalBars:  int(result.total_bars),

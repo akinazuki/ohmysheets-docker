@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -38,10 +39,16 @@ func runCLI(args []string) {
 	}
 
 	images := args
-	midPath := "/app/output/output.mid"
+	outPath := "/app/output/output.mid"
+	outFormat := "mid"
 
-	if last := args[len(args)-1]; strings.HasSuffix(strings.ToLower(last), ".mid") {
-		midPath = last
+	last := strings.ToLower(args[len(args)-1])
+	if strings.HasSuffix(last, ".mid") {
+		outPath = args[len(args)-1]
+		images = args[:len(args)-1]
+	} else if strings.HasSuffix(last, ".musicxml") || strings.HasSuffix(last, ".xml") {
+		outPath = args[len(args)-1]
+		outFormat = "musicxml"
 		images = args[:len(args)-1]
 	}
 
@@ -83,13 +90,24 @@ func runCLI(args []string) {
 		os.Exit(1)
 	}
 
-	if err := os.WriteFile(midPath, res.MIDI, 0644); err != nil {
-		fmt.Fprintf(os.Stderr, "Error writing %s: %v\n", midPath, err)
+	var outData []byte
+	if outFormat == "musicxml" {
+		if len(res.MusicXML) == 0 {
+			fmt.Fprintln(os.Stderr, "Error: MusicXML export produced no data")
+			os.Exit(1)
+		}
+		outData = res.MusicXML
+	} else {
+		outData = res.MIDI
+	}
+
+	if err := os.WriteFile(outPath, outData, 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "Error writing %s: %v\n", outPath, err)
 		os.Exit(1)
 	}
 
 	fmt.Fprintf(os.Stderr, "Output: %s (%d bytes, %d notes, %d bars, %d staves)\n",
-		midPath, len(res.MIDI), res.TotalNotes, res.TotalBars, res.NumStaves)
+		outPath, len(outData), res.TotalNotes, res.TotalBars, res.NumStaves)
 }
 
 // --- HTTP server mode (gin) ---
@@ -101,6 +119,17 @@ func serve(addr string) {
 	log.Printf("SMS engine initialized")
 
 	r := gin.Default()
+
+	r.Use(func(c *gin.Context) {
+		c.Header("Access-Control-Allow-Origin", "*")
+		c.Header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		c.Header("Access-Control-Allow-Headers", "Content-Type")
+		if c.Request.Method == "OPTIONS" {
+			c.AbortWithStatus(http.StatusNoContent)
+			return
+		}
+		c.Next()
+	})
 
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
@@ -139,6 +168,11 @@ func handleAnalyze(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no 'images' field"})
 		return
 	}
+
+	// Sort by filename to ensure correct page order
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].Filename < files[j].Filename
+	})
 
 	// Set SSE headers early so we can stream during image loading
 	c.Header("Content-Type", "text/event-stream")
@@ -245,10 +279,14 @@ func handleAnalyze(c *gin.Context) {
 	log.Printf("  Result: %d bytes, %d notes, %d bars, %d staves",
 		len(res.MIDI), res.TotalNotes, res.TotalBars, res.NumStaves)
 
-	writeSSE("result", gin.H{
+	resultData := gin.H{
 		"total_notes": res.TotalNotes,
 		"total_bars":  res.TotalBars,
 		"num_staves":  res.NumStaves,
 		"midi":        base64.StdEncoding.EncodeToString(res.MIDI),
-	})
+	}
+	if len(res.MusicXML) > 0 {
+		resultData["musicxml"] = string(res.MusicXML)
+	}
+	writeSSE("result", resultData)
 }

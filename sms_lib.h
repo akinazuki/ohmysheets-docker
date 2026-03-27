@@ -19,6 +19,8 @@ typedef struct {
     int num_staves;
     unsigned char *midi_data; /* merged MIDI, caller must free() */
     int midi_len;
+    unsigned char *musicxml_data; /* MusicXML, caller must free() */
+    int musicxml_len;
     SmsMidi *page_midis;  /* per-page MIDI array [num_pages], caller must free each .data and the array */
     int num_pages;
     char error_msg[256];
